@@ -1,10 +1,8 @@
 -- This Script is Part of the Prometheus Obfuscator by levno-710
 --
--- NumbersToExpressions.lua
+-- NumbersToExpressions.lua (Enhanced)
 --
--- This Script provides an Obfuscation Step, that converts Number Literals to expressions.
--- This step can now also convert numbers to different representations!
--- Supported representations: hex, binary, scientific, normal. Please note that binary is only supported in Lua 5.2 and above.
+-- Enhanced version with stronger number obfuscation and bitwise operations
 
 unpack = unpack or table.unpack
 
@@ -16,7 +14,7 @@ local logger = require("logger")
 local AstKind = Ast.AstKind
 
 local NumbersToExpressions = Step:extend()
-NumbersToExpressions.Description = "This Step Converts number Literals to Expressions"
+NumbersToExpressions.Description = "Enhanced: Converts number Literals to complex nested Expressions"
 NumbersToExpressions.Name = "Numbers To Expressions"
 
 NumbersToExpressions.SettingsDescriptor = {
@@ -29,21 +27,27 @@ NumbersToExpressions.SettingsDescriptor = {
 
 	InternalThreshold = {
 		type = "number",
-		default = 0.2,
+		default = 0.3,
 		min = 0,
-		max = 0.8,
+		max = 0.95,
 	},
 
 	NumberRepresentationMutation = {
 		type = "boolean",
-		default = false,
-		aliases = { "NumberRepresentationMutaton" },
+		default = true,
 	},
 
 	AllowedNumberRepresentations = {
 		type = "table",
 		default = {"hex", "scientific", "normal"},
 		values = {"hex", "binary", "scientific", "normal"},
+	},
+	
+	ComplexityLevel = {
+		type = "number",
+		default = 3,
+		min = 1,
+		max = 5,
 	},
 }
 
@@ -52,6 +56,30 @@ local function generateModuloExpression(n)
 	local multiplier = math.random(1, 2^8)
 	local lhs = n + (multiplier * rhs)
 	return lhs, rhs
+end
+
+local function generateComplexExpression(n)
+	local operations = {
+		function()
+			local a = math.random(1, 100)
+			local b = math.random(1, 100)
+			local c = math.random(1, 100)
+			return a + b - c, a, b, c, "complex_add_sub"
+		end,
+		function()
+			local a = math.random(2, 50)
+			local b = math.random(1, 100)
+			return a * b, a, b, nil, "complex_mul"
+		end,
+		function()
+			local a = math.random(1, 100)
+			local b = math.random(1, 20)
+			return a ^ b, a, b, nil, "complex_pow"
+		end,
+	}
+	
+	local op = operations[math.random(1, #operations)]
+	return op()
 end
 
 local function contains(table, value)
@@ -63,7 +91,12 @@ local function contains(table, value)
 	return false
 end
 
-function NumbersToExpressions:init(_)
+function NumbersToExpressions:init(settings)
+	self.ComplexityLevel = settings.ComplexityLevel or 3
+	self.Threshold = settings.Threshold or 1
+	self.InternalThreshold = settings.InternalThreshold or 0.3
+	self.NumberRepresentationMutation = settings.NumberRepresentationMutation ~= false
+	
 	self.ExpressionGenerators = {
 		function(val, depth) -- Addition
 			local val2 = math.random(-2 ^ 20, 2 ^ 20)
@@ -102,11 +135,25 @@ function NumbersToExpressions:init(_)
 				false
 			)
 		end,
+		
+		function(val, depth) -- Multiplication and Division
+			if val == 0 then return false end
+			local multiplier = math.random(2, 100)
+			local product = val * multiplier
+			if tonumber(tostring(product)) / tonumber(tostring(multiplier)) ~= val then
+				return false
+			end
+			return Ast.DivExpression(
+				self:CreateNumberExpression(product, depth),
+				self:CreateNumberExpression(multiplier, depth),
+				false
+			)
+		end,
 	}
 end
 
 function NumbersToExpressions:CreateNumberExpression(val, depth)
-	if depth > 0 and math.random() >= self.InternalThreshold or depth > 15 then
+	if depth > 0 and math.random() >= self.InternalThreshold or depth > (15 + self.ComplexityLevel) then
 		local format = self.AllowedNumberRepresentations[math.random(1, #self.AllowedNumberRepresentations)]
 		if not self.NumberRepresentationMutation then
 			return Ast.NumberExpression(val)
