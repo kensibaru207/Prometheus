@@ -1,8 +1,8 @@
 -- This Script is Part of the Prometheus Obfuscator by levno-710
 --
--- ProxifyLocals.lua
+-- ProxifyLocals.lua (Enhanced)
 --
--- This Script provides a Obfuscation Step for putting all Locals into Proxy Objects
+-- Enhanced version with stronger obfuscation and nested proxification
 
 local Step = require("prometheus.step");
 local Ast = require("prometheus.ast");
@@ -13,10 +13,16 @@ local RandomLiterals = require("prometheus.randomLiterals")
 local AstKind = Ast.AstKind;
 
 local ProxifyLocals = Step:extend();
-ProxifyLocals.Description = "This Step wraps all locals into Proxy Objects";
+ProxifyLocals.Description = "Enhanced: Wraps all locals into nested Proxy Objects with multi-layer indirection";
 ProxifyLocals.Name = "Proxify Locals";
 
 ProxifyLocals.SettingsDescriptor = {
+	Threshold = {
+		type = "number",
+		default = 1,
+		min = 0,
+		max = 1,
+	},
 	LiteralType = {
 		name = "LiteralType",
 		description = "The type of the randomly generated literals",
@@ -29,6 +35,12 @@ ProxifyLocals.SettingsDescriptor = {
 		},
 		default = "string",
 	},
+	NestedProxyDepth = {
+		type = "number",
+		default = 2,
+		min = 1,
+		max = 5,
+	},
 }
 
 local function shallowcopy(orig)
@@ -39,7 +51,7 @@ local function shallowcopy(orig)
         for orig_key, orig_value in pairs(orig) do
             copy[orig_key] = orig_value
         end
-    else -- number, string, boolean, etc
+    else
         copy = orig
     end
     return copy
@@ -83,11 +95,16 @@ local MetatableExpressions = {
     }
 }
 
-function ProxifyLocals:init(_) end
+function ProxifyLocals:init(settings)
+	self.Threshold = settings.Threshold or 1
+	self.NestedProxyDepth = settings.NestedProxyDepth or 2
+end
 
-local function generateLocalMetatableInfo(pipeline)
+local function generateLocalMetatableInfo(pipeline, depth)
     local usedOps = {};
     local info = {};
+    depth = depth or 1
+    
     for i, v in ipairs({"setValue", "getValue", "index"}) do
         local rop;
         repeat
@@ -98,6 +115,12 @@ local function generateLocalMetatableInfo(pipeline)
     end
 
     info.valueName = callNameGenerator(pipeline.namegenerator, math.random(1, 4096));
+    info.depth = depth
+    info.proxyLayers = {}
+    
+    for layer = 1, depth do
+        info.proxyLayers[layer] = callNameGenerator(pipeline.namegenerator, math.random(1, 4096))
+    end
 
     return info;
 end
@@ -105,16 +128,16 @@ end
 function ProxifyLocals:CreateAssignmentExpression(info, expr, parentScope)
     local metatableVals = {};
 
-    -- Setvalue Entry
     local setValueFunctionScope = Scope:new(parentScope);
     local setValueSelf = setValueFunctionScope:addVariable();
     local setValueArg = setValueFunctionScope:addVariable();
+    
     local setvalueFunctionLiteral = Ast.FunctionLiteralExpression(
         {
-            Ast.VariableExpression(setValueFunctionScope, setValueSelf), -- Argument 1
-            Ast.VariableExpression(setValueFunctionScope, setValueArg), -- Argument 2
+            Ast.VariableExpression(setValueFunctionScope, setValueSelf),
+            Ast.VariableExpression(setValueFunctionScope, setValueArg),
         },
-        Ast.Block({ -- Create Function Body
+        Ast.Block({
             Ast.AssignmentStatement({
                 Ast.AssignmentIndexing(Ast.VariableExpression(setValueFunctionScope, setValueSelf), Ast.StringExpression(info.valueName));
             }, {
@@ -124,11 +147,11 @@ function ProxifyLocals:CreateAssignmentExpression(info, expr, parentScope)
     );
     table.insert(metatableVals, Ast.KeyedTableEntry(Ast.StringExpression(info.setValue.key), setvalueFunctionLiteral));
 
-    -- Getvalue Entry
     local getValueFunctionScope = Scope:new(parentScope);
     local getValueSelf = getValueFunctionScope:addVariable();
     local getValueArg = getValueFunctionScope:addVariable();
     local getValueIdxExpr;
+    
     if(info.getValue.key == "__index" or info.setValue.key == "__index") then
         getValueIdxExpr = Ast.FunctionCallExpression(Ast.VariableExpression(getValueFunctionScope:resolveGlobal("rawget")), {
             Ast.VariableExpression(getValueFunctionScope, getValueSelf),
@@ -137,12 +160,13 @@ function ProxifyLocals:CreateAssignmentExpression(info, expr, parentScope)
     else
         getValueIdxExpr = Ast.IndexExpression(Ast.VariableExpression(getValueFunctionScope, getValueSelf), Ast.StringExpression(info.valueName));
     end
+    
     local getvalueFunctionLiteral = Ast.FunctionLiteralExpression(
         {
-            Ast.VariableExpression(getValueFunctionScope, getValueSelf), -- Argument 1
-            Ast.VariableExpression(getValueFunctionScope, getValueArg), -- Argument 2
+            Ast.VariableExpression(getValueFunctionScope, getValueSelf),
+            Ast.VariableExpression(getValueFunctionScope, getValueArg),
         },
-        Ast.Block({ -- Create Function Body
+        Ast.Block({
             Ast.ReturnStatement({
                 getValueIdxExpr;
             });
@@ -151,61 +175,64 @@ function ProxifyLocals:CreateAssignmentExpression(info, expr, parentScope)
     table.insert(metatableVals, Ast.KeyedTableEntry(Ast.StringExpression(info.getValue.key), getvalueFunctionLiteral));
 
     parentScope:addReferenceToHigherScope(self.setMetatableVarScope, self.setMetatableVarId);
-    return Ast.FunctionCallExpression(
-        Ast.VariableExpression(self.setMetatableVarScope, self.setMetatableVarId),
-        {
-            Ast.TableConstructorExpression({
-                Ast.KeyedTableEntry(Ast.StringExpression(info.valueName), expr)
-            }),
-            Ast.TableConstructorExpression(metatableVals)
-        }
-    );
+    
+    local wrappedExpr = expr
+    for layer = 1, info.depth do
+        wrappedExpr = Ast.FunctionCallExpression(
+            Ast.VariableExpression(self.setMetatableVarScope, self.setMetatableVarId),
+            {
+                Ast.TableConstructorExpression({
+                    Ast.KeyedTableEntry(Ast.StringExpression(info.valueName), wrappedExpr)
+                }),
+                Ast.TableConstructorExpression(metatableVals)
+            }
+        );
+    end
+    
+    return wrappedExpr
 end
 
 function ProxifyLocals:apply(ast, pipeline)
     local localMetatableInfos = {};
     local function getLocalMetatableInfo(scope, id)
-        -- Global Variables should not be transformed
         if(scope.isGlobal) then return nil end;
 
         localMetatableInfos[scope] = localMetatableInfos[scope] or {};
         if localMetatableInfos[scope][id] then
-            -- If locked, return no Metatable
             if localMetatableInfos[scope][id].locked then
                 return nil
             end
             return localMetatableInfos[scope][id];
         end
-        local localMetatableInfo = generateLocalMetatableInfo(pipeline);
+        
+        if math.random() > self.Threshold then
+            return nil
+        end
+        
+        local localMetatableInfo = generateLocalMetatableInfo(pipeline, self.NestedProxyDepth);
         localMetatableInfos[scope][id] = localMetatableInfo;
         return localMetatableInfo;
     end
 
     local function disableMetatableInfo(scope, id)
-        -- Global Variables should not be transformed
         if(scope.isGlobal) then return nil end;
 
         localMetatableInfos[scope] = localMetatableInfos[scope] or {};
         localMetatableInfos[scope][id] = {locked = true}
     end
 
-    -- Create Setmetatable Variable
     self.setMetatableVarScope = ast.body.scope;
     self.setMetatableVarId = ast.body.scope:addVariable();
 
-    -- Create Empty Function Variable
     self.emptyFunctionScope = ast.body.scope;
     self.emptyFunctionId = ast.body.scope:addVariable();
     self.emptyFunctionUsed = false;
 
-    -- Add Empty Function Declaration
     table.insert(ast.body.statements, 1, Ast.LocalVariableDeclaration(self.emptyFunctionScope, {self.emptyFunctionId}, {
         Ast.FunctionLiteralExpression({}, Ast.Block({}, Scope:new(ast.body.scope)));
     }));
 
-
     visitast(ast, function(node, data)
-        -- Lock for loop variables
         if(node.kind == AstKind.ForStatement) then
             disableMetatableInfo(node.scope, node.id)
         end
@@ -215,7 +242,6 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
 
-        -- Lock Function Arguments
         if(node.kind == AstKind.FunctionDeclaration or node.kind == AstKind.LocalFunctionDeclaration or node.kind == AstKind.FunctionLiteralExpression) then
             for i, expr in ipairs(node.args) do
                 if expr.kind == AstKind.VariableExpression then
@@ -224,7 +250,6 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
 
-        -- Assignment Statements may be Obfuscated Differently
         if(node.kind == AstKind.AssignmentStatement) then
             if(#node.lhs == 1 and node.lhs[1].kind == AstKind.AssignmentVariable) then
                 local variable = node.lhs[1];
@@ -241,12 +266,10 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
     end, function(node, data)
-        -- Local Variable Declaration
         if(node.kind == AstKind.LocalVariableDeclaration) then
             for i, id in ipairs(node.ids) do
                 local expr = node.expressions[i] or Ast.NilExpression();
                 local localMetatableInfo = getLocalMetatableInfo(node.scope, id);
-                -- Apply Only to Some Variables if Threshold is non 1
                 if localMetatableInfo then
                     local newExpr = self:CreateAssignmentExpression(localMetatableInfo, expr, node.scope);
                     node.expressions[i] = newExpr;
@@ -254,10 +277,8 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
 
-        -- Variable Expression
         if(node.kind == AstKind.VariableExpression and not node.__ignoreProxifyLocals) then
             local localMetatableInfo = getLocalMetatableInfo(node.scope, node.id);
-            -- Apply Only to Some Variables if Threshold is non 1
             if localMetatableInfo then
                 local literal;
                 if self.LiteralType == "dictionary" then
@@ -273,19 +294,15 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
 
-        -- Assignment Variable for Assignment Statement
         if(node.kind == AstKind.AssignmentVariable) then
             local localMetatableInfo = getLocalMetatableInfo(node.scope, node.id);
-            -- Apply Only to Some Variables if Threshold is non 1
             if localMetatableInfo then
                 return Ast.AssignmentIndexing(node, Ast.StringExpression(localMetatableInfo.valueName));
             end
         end
 
-        -- Local Function Declaration
         if(node.kind == AstKind.LocalFunctionDeclaration) then
             local localMetatableInfo = getLocalMetatableInfo(node.scope, node.id);
-            -- Apply Only to Some Variables if Threshold is non 1
             if localMetatableInfo then
                 local funcLiteral = Ast.FunctionLiteralExpression(node.args, node.body);
                 local newExpr = self:CreateAssignmentExpression(localMetatableInfo, funcLiteral, node.scope);
@@ -293,7 +310,6 @@ function ProxifyLocals:apply(ast, pipeline)
             end
         end
 
-        -- Function Declaration
         if(node.kind == AstKind.FunctionDeclaration) then
             local localMetatableInfo = getLocalMetatableInfo(node.scope, node.id);
             if(localMetatableInfo) then
@@ -302,7 +318,6 @@ function ProxifyLocals:apply(ast, pipeline)
         end
     end)
 
-    -- Add Setmetatable Variable Declaration
     table.insert(ast.body.statements, 1, Ast.LocalVariableDeclaration(self.setMetatableVarScope, {self.setMetatableVarId}, {
         Ast.VariableExpression(self.setMetatableVarScope:resolveGlobal("setmetatable"))
     }));
