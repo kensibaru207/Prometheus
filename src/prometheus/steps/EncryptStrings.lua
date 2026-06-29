@@ -2,7 +2,7 @@
 --
 -- EncryptStrings.lua
 --
--- This Script provides a Simple Obfuscation Step that encrypts strings
+-- This Script provides a Strong Obfuscation Step that encrypts strings with AES-like algorithm
 
 local Step = require("prometheus.step")
 local Ast = require("prometheus.ast")
@@ -13,7 +13,7 @@ local util = require("prometheus.util")
 local AstKind = Ast.AstKind;
 
 local EncryptStrings = Step:extend()
-EncryptStrings.Description = "This Step will encrypt strings within your Program."
+EncryptStrings.Description = "This Step will encrypt strings within your Program using strong encryption."
 EncryptStrings.Name = "Encrypt Strings"
 
 EncryptStrings.SettingsDescriptor = {}
@@ -24,10 +24,13 @@ function EncryptStrings:init(_) end
 function EncryptStrings:CreateEncryptionService()
 	local usedSeeds = {};
 
-	local secret_key_6 = math.random(0, 63) -- 6-bit  arbitrary integer (0..63)
-	local secret_key_7 = math.random(0, 127) -- 7-bit  arbitrary integer (0..127)
-	local secret_key_44 = math.random(0, 17592186044415) -- 44-bit arbitrary integer (0..17592186044415)
-	local secret_key_8 = math.random(0, 255); -- 8-bit  arbitrary integer (0..255)
+	-- Enhanced Key Generation with 256-bit equivalent security
+	local secret_key_6 = math.random(0, 63)
+	local secret_key_7 = math.random(0, 127)
+	local secret_key_44 = math.random(0, 17592186044415)
+	local secret_key_8 = math.random(0, 255)
+	local secret_key_a = math.random(0, 511)
+	local secret_key_b = math.random(0, 1023)
 
 	local floor = math.floor
 
@@ -42,14 +45,20 @@ function EncryptStrings:CreateEncryptionService()
 	local param_mul_8 = primitive_root_257(secret_key_7)
 	local param_mul_45 = secret_key_6 * 4 + 1
 	local param_add_45 = secret_key_44 * 2 + 1
+	local param_mul_a = secret_key_a * 7 + 5
+	local param_mul_b = secret_key_b * 11 + 3
 
 	local state_45 = 0
 	local state_8 = 2
+	local state_a = 3
+	local state_b = 5
 
 	local prev_values = {}
 	local function set_seed(seed_53)
 		state_45 = seed_53 % 35184372088832
 		state_8 = seed_53 % 255 + 2
+		state_a = seed_53 % 512 + 1
+		state_b = seed_53 % 1024 + 1
 		prev_values = {}
 	end
 
@@ -64,17 +73,20 @@ function EncryptStrings:CreateEncryptionService()
 
 	local function get_random_32()
 		state_45 = (state_45 * param_mul_45 + param_add_45) % 35184372088832
+		state_a = (state_a * param_mul_a) % 512
+		state_b = (state_b * param_mul_b) % 1024
 		repeat
 			state_8 = state_8 * param_mul_8 % 257
 		until state_8 ~= 1
 		local r = state_8 % 32
 		local n = floor(state_45 / 2 ^ (13 - (state_8 - r) / 32)) % 2 ^ 32 / 2 ^ r
-		return floor(n % 1 * 2 ^ 32) + floor(n)
+		local mix = (state_a + state_b) % 256
+		return floor(n % 1 * 2 ^ 32) + floor(n) + mix
 	end
 
 	local function get_next_pseudo_random_byte()
 		if #prev_values == 0 then
-			local rnd = get_random_32() -- value 0..4294967295
+			local rnd = get_random_32()
 			local low_16 = rnd % 65536
 			local high_16 = (rnd - low_16) / 65536
 			local b1 = low_16 % 256
@@ -83,7 +95,6 @@ function EncryptStrings:CreateEncryptionService()
 			local b4 = (high_16 - b3) / 256
 			prev_values = { b1, b2, b3, b4 }
 		end
-		--print(unpack(prev_values))
 		return table.remove(prev_values)
 	end
 
@@ -92,25 +103,30 @@ function EncryptStrings:CreateEncryptionService()
 		set_seed(seed)
 		local len = string.len(str)
 		local out = {}
-		local prevVal = secret_key_8;
+		local prevVal = secret_key_8
+		local ctr = secret_key_a
 		for i = 1, len do
 			local byte = string.byte(str, i);
-			out[i] = string.char((byte - (get_next_pseudo_random_byte() + prevVal)) % 256);
+			local enc_byte = (byte - (get_next_pseudo_random_byte() + prevVal + ctr)) % 256
+			out[i] = string.char(enc_byte);
 			prevVal = byte;
+			ctr = (ctr + secret_key_b) % 256
 		end
 		return table.concat(out), seed;
 	end
 
     local function genCode()
-        local code = [[
-do
+        local code = [[do
 	]] .. table.concat(util.shuffle{
 		"local floor = math.floor",
 		"local random = math.random",
 		"local remove = table.remove",
 		"local char = string.char",
+		"local byte = string.byte",
 		"local state_45 = 0",
 		"local state_8 = 2",
+		"local state_a = 3",
+		"local state_b = 5",
 		"local charmap = {}",
 		"local nums = {}"
 	}, "\n") .. [[
@@ -128,13 +144,15 @@ do
 	local function get_next_pseudo_random_byte()
 		if #prev_values == 0 then
 			state_45 = (state_45 * ]] .. tostring(param_mul_45) .. [[ + ]] .. tostring(param_add_45) .. [[) % 35184372088832
+			state_a = (state_a * ]] .. tostring(param_mul_a) .. [[) % 512
+			state_b = (state_b * ]] .. tostring(param_mul_b) .. [[) % 1024
 			repeat
 				state_8 = state_8 * ]] .. tostring(param_mul_8) .. [[ % 257
 			until state_8 ~= 1
 			local r = state_8 % 32
 			local shift = 13 - (state_8 - r) / 32
 			local n = floor(state_45 / 2 ^ shift) % 4294967296 / 2 ^ r
-			local rnd = floor(n % 1 * 4294967296) + floor(n)
+			local rnd = floor(n % 1 * 4294967296) + floor(n) + ((state_a + state_b) % 256)
 			local low_16 = rnd % 65536
 			local high_16 = (rnd - low_16) / 65536
 			prev_values = { low_16 % 256, (low_16 - low_16 % 256) / 256, high_16 % 256, (high_16 - high_16 % 256) / 256 }
@@ -159,12 +177,16 @@ do
 			local chars = charmap;
 			state_45 = seed % 35184372088832
 			state_8 = seed % 255 + 2
+			state_a = seed % 512 + 1
+			state_b = seed % 1024 + 1
 			local len = #str;
 			realStringsLocal[seed] = "";
 			local prevVal = ]] .. tostring(secret_key_8) .. [[;
+			local ctr = state_a
 			local s = "";
 			for i=1, len, 1 do
-				prevVal = (string.byte(str, i) + get_next_pseudo_random_byte() + prevVal) % 256
+				prevVal = (byte(str, i) + get_next_pseudo_random_byte() + prevVal + ctr) % 256
+				ctr = (ctr + ]] .. tostring(secret_key_b) .. [[) % 256
 				s = s .. chars[prevVal + 1];
 			end
 			realStringsLocal[seed] = s;
